@@ -1,0 +1,6 @@
+Flask
+peewee==3.18.1
+python-dateutil
+flasgger
+PyJWT
+Flask-Cors
