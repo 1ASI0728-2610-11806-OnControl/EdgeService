@@ -56,18 +56,22 @@ class HealthRecordService:
         """
         Evaluates if the provided health metrics indicate a risk situation.
         
-        Risk Criteria (simplified):
-        - BPM: > 100 (Tachycardia) or < 50 (Bradycardia)
-        - Temp: > 37.5 (Fever) or < 35.0 (Hypothermia)
-        - SpO2: < 90 (Hypoxia)
+        Demo risk criteria:
+        - BPM: > 120 or < 50
+        - Temp: > 38.0 or < 35.5
+        - SpO2: < 92
         
         Returns:
             bool: True if actuator alarm should be triggered, False otherwise.
         """
-        if bpm > 100 or bpm < 50:
+        bpm = float(bpm)
+        temp = float(temp)
+        spo2 = float(spo2)
+
+        if bpm > 120 or bpm < 50:
             return True
-        if temp > 37.5 or temp < 35.0:
+        if temp > 38.0 or temp < 35.5:
             return True
-        if spo2 < 90:
+        if spo2 < 92:
             return True
         return False

@@ -4,3 +4,4 @@ python-dateutil
 flasgger
 PyJWT
 Flask-Cors
+gunicorn

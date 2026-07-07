@@ -1,3 +1,5 @@
+import os
+
 from flask import Blueprint, request, jsonify, g
 from flasgger import swag_from
 from health.application.services import HealthRecordApplicationService
@@ -35,6 +37,26 @@ health_record_input_def = {
         "created_at": {"type": "string", "format": "date-time", "description": "Optional."}
     }
 }
+
+
+def format_created_at(created_at):
+    """Return a compact ISO timestamp suitable for JSON responses."""
+    return created_at.isoformat().replace("+00:00", "Z")
+
+
+def serialize_health_record(record, include_id=True):
+    """Serialize a health record with the risk status expected by clients."""
+    payload = {
+        "device_id": record.device_id,
+        "bpm": record.bpm,
+        "temp": record.temp,
+        "spo2": record.spo2,
+        "created_at": format_created_at(record.created_at),
+        "is_critical": health_record_service.check_health_risk(record.bpm, record.temp, record.spo2)
+    }
+    if include_id:
+        payload["id"] = record.id
+    return payload
 
 
 # --- GET Endpoint for Logged-in Users (JWT Auth) ---
@@ -79,19 +101,7 @@ def get_health_records():
     else:
         return jsonify({"error": "Your user profile type cannot access this data"}), 403
 
-    # Serialize the response
-    result = [
-        {
-            "id": record.id,
-            "device_id": record.device_id,
-            "bpm": record.bpm,
-            "temp": record.temp,
-            "spo2": record.spo2,
-            "created_at": record.created_at.isoformat() + "Z",
-            "is_critical": health_record_service.check_health_risk(record.bpm, record.temp, record.spo2)
-        }
-        for record in records
-    ]
+    result = [serialize_health_record(record) for record in records]
     return jsonify(result), 200
 
 
@@ -139,21 +149,35 @@ def get_latest_health_record():
     if not record:
         return jsonify({"error": "No health records found for claimed devices"}), 404
 
-    # Serialize the single record response
-    result = {
-        "id": record.id,
-        "device_id": record.device_id,
-        "bpm": record.bpm,
-        "temp": record.temp,
-        "spo2": record.spo2,
-        "created_at": record.created_at.isoformat() + "Z",
-        "is_critical": health_record_service.check_health_risk(record.bpm, record.temp, record.spo2)
+    result = serialize_health_record(record)
+    return jsonify(result), 200
+
+
+
+# --- GET Latest Endpoint for Academic Demo (No JWT) ---
+@health_api.route("/OnControl/parameters/latest-demo", methods=["GET"])
+@swag_from({
+    'tags': ['Health Monitoring (Demo)'],
+    'summary': 'Retrieve the latest demo health data record without JWT',
+    'description': 'Fetches the most recent record for the configured demo device.',
+    'responses': {
+        '200': {
+            'description': 'The latest demo health record.',
+            'schema': health_record_def
+        },
+        '404': {'description': 'Not Found (no demo records found).'}
     }
-    return jsonify(result), 200
+})
+def get_latest_health_record_demo():
+    """Fetch the latest record for the configured demo device without JWT."""
+    demo_device_id = os.getenv("DEVICE_ID", "smart-band-001")
+    record = health_record_service.get_latest_record_for_device(demo_device_id)
 
+    if not record:
+        return jsonify({"error": "No health records found for demo device"}), 404
 
+    return jsonify(serialize_health_record(record, include_id=False)), 200
 
-    return jsonify(result), 200
 
 # --- POST Endpoint for Devices (API Key Auth) ---
 @health_api.route("/OnControl/parameters", methods=["POST"])
@@ -211,7 +235,8 @@ def create_health_record():
             "bpm": record.bpm,
             "temp": record.temp,
             "spo2": record.spo2,
-            "created_at": record.created_at.isoformat() + "Z",
+            "created_at": format_created_at(record.created_at),
+            "is_critical": trigger_alert,
             "actuator_command": {
                 "alarm": trigger_alert
             }

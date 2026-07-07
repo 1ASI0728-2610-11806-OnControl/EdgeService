@@ -1,4 +1,6 @@
 """Repositories for the IAM bounded context."""
+import os
+from datetime import datetime, timezone
 from typing import Optional
 
 import peewee
@@ -8,6 +10,9 @@ from iam.infrastructure.models import Device as DeviceModel, DeviceOwnership as 
 
 class DeviceRepository:
     """Repository for managing Device entities."""
+
+    DEFAULT_DEVICE_ID = "smart-band-001"
+    DEFAULT_DEVICE_API_KEY = "oncontrol-grupo2-demo-key"
 
     @staticmethod
     def find_by_id_and_api_key(device_id: str, api_key: str) -> Optional[Device]:
@@ -35,10 +40,21 @@ class DeviceRepository:
         Returns:
             Device: The test device entity.
         """
+        device_id = os.getenv("DEVICE_ID", DeviceRepository.DEFAULT_DEVICE_ID)
+        api_key = os.getenv("DEVICE_API_KEY", DeviceRepository.DEFAULT_DEVICE_API_KEY)
+
         device, _ = DeviceModel.get_or_create(
-            device_id="smart-band-001",
-            defaults={"api_key": "test-api-key-123", "created_at": "2025-06-04T23:23:00Z"}
+            device_id=device_id,
+            defaults={
+                "api_key": api_key,
+                "created_at": datetime.now(timezone.utc)
+            }
         )
+
+        if device.api_key != api_key:
+            device.api_key = api_key
+            device.save()
+
         return Device(device.device_id, device.api_key, device.created_at)
 
 
