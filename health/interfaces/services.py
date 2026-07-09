@@ -1,4 +1,8 @@
+import json
+import logging
 import os
+import urllib.error
+import urllib.request
 
 from flask import Blueprint, request, jsonify, g
 from flasgger import swag_from
@@ -8,10 +12,16 @@ from shared.auth import require_jwt
 from iam.application.services import DeviceOwnershipApplicationService # New import
 
 health_api = Blueprint("health_api", __name__)
+logger = logging.getLogger(__name__)
 
 # Initialize dependencies
 health_record_service = HealthRecordApplicationService()
 device_ownership_service = DeviceOwnershipApplicationService() # New initialization
+
+DEFAULT_AI_EXPLANATION = (
+    "Se detectaron valores fuera del rango esperado en oxigenación, temperatura y ritmo cardíaco. "
+    "Revise el panel del paciente para priorizar el seguimiento."
+)
 
 # --- Reusable Swagger/OpenAPI Schema Definitions ---
 health_record_def = {
@@ -21,8 +31,13 @@ health_record_def = {
         "device_id": {"type": "string"},
         "bpm": {"type": "number"},
         "temp": {"type": "number"},
+        "temperature": {"type": "number"},
         "spo2": {"type": "number"},
-        "created_at": {"type": "string", "format": "date-time"}
+        "created_at": {"type": "string", "format": "date-time"},
+        "riskScore": {"type": "number"},
+        "riskLevel": {"type": "string"},
+        "reasons": {"type": "array", "items": {"type": "string"}},
+        "aiExplanation": {"type": "string"}
     }
 }
 
@@ -44,16 +59,147 @@ def format_created_at(created_at):
     return created_at.isoformat().replace("+00:00", "Z")
 
 
-def serialize_health_record(record, include_id=True):
+def calculate_predictive_risk(bpm: float, temp: float, spo2: float) -> dict:
+    """Calculate a local predictive risk score from vital signs.
+
+    This function does not call an LLM. It only produces a deterministic score,
+    level and reason list so the external local AI can redact a short message.
+    """
+    bpm = float(bpm)
+    temp = float(temp)
+    spo2 = float(spo2)
+
+    score = 0
+    reasons: list[str] = []
+
+    if spo2 < 95:
+        score += 30
+        reasons.append("SpO2 baja")
+    if spo2 < 92:
+        score += 20
+
+    if bpm > 110:
+        score += 20
+        reasons.append("BPM alto")
+    elif bpm < 50:
+        score += 20
+        reasons.append("BPM bajo")
+
+    if temp > 37.8:
+        score += 20
+        reasons.append("temperatura elevada")
+    if temp > 38.5:
+        score += 10
+    elif temp < 35.5:
+        score += 15
+        reasons.append("temperatura baja")
+
+    score = min(score, 100)
+
+    if score <= 39:
+        level = "LOW"
+    elif score <= 69:
+        level = "MODERATE"
+    else:
+        level = "HIGH"
+
+    if not reasons:
+        reasons.append("valores dentro del rango esperado")
+
+    return {
+        "riskScore": score,
+        "riskLevel": level,
+        "reasons": reasons
+    }
+
+
+def is_local_ai_enabled() -> bool:
+    """Return whether the optional local AI integration is enabled."""
+    return os.getenv("LOCAL_AI_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
+
+
+def call_local_ai_explanation(bpm: float, temp: float, spo2: float, risk: dict) -> str:
+    """Call the local AI proxy exposed with Cloudflare Tunnel.
+
+    Falls back to a safe default explanation when the proxy is disabled, unavailable,
+    slow or returns an unexpected response.
+    """
+    if not is_local_ai_enabled():
+        logger.info("Local AI disabled. Using fallback explanation.")
+        return DEFAULT_AI_EXPLANATION
+
+    base_url = os.getenv("LOCAL_AI_BASE_URL", "").strip().rstrip("/")
+    api_key = os.getenv("LOCAL_AI_API_KEY", "").strip()
+    timeout_ms_raw = os.getenv("LOCAL_AI_TIMEOUT_MS", "6000").strip()
+
+    if not base_url or not api_key:
+        logger.warning("Local AI env vars missing. Using fallback explanation.")
+        return DEFAULT_AI_EXPLANATION
+
+    try:
+        timeout_seconds = max(float(timeout_ms_raw) / 1000, 0.5)
+    except ValueError:
+        timeout_seconds = 6.0
+
+    payload = {
+        "bpm": float(bpm),
+        "spo2": float(spo2),
+        "temperature": float(temp),
+        "riskScore": risk["riskScore"],
+        "riskLevel": risk["riskLevel"],
+        "reasons": risk["reasons"]
+    }
+
+    try:
+        request_data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            f"{base_url}/risk-explanation",
+            data=request_data,
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "X-Local-AI-Key": api_key
+            }
+        )
+
+        with urllib.request.urlopen(req, timeout=timeout_seconds) as response:
+            response_body = response.read().decode("utf-8")
+            parsed = json.loads(response_body)
+
+        explanation = str(parsed.get("explanation", "")).strip()
+        if explanation:
+            logger.info("Local AI explanation generated successfully.")
+            return explanation
+
+        logger.warning("Local AI returned an empty explanation. Using fallback.")
+        return DEFAULT_AI_EXPLANATION
+
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, ValueError, json.JSONDecodeError) as exc:
+        logger.warning("Local AI call failed. Using fallback explanation. Error: %s", exc)
+        return DEFAULT_AI_EXPLANATION
+
+
+def serialize_health_record(record, include_id=True, include_ai=False):
     """Serialize a health record with the risk status expected by clients."""
+    is_critical = health_record_service.check_health_risk(record.bpm, record.temp, record.spo2)
+    risk = calculate_predictive_risk(record.bpm, record.temp, record.spo2)
+
     payload = {
         "device_id": record.device_id,
         "bpm": record.bpm,
         "temp": record.temp,
+        "temperature": record.temp,
         "spo2": record.spo2,
         "created_at": format_created_at(record.created_at),
-        "is_critical": health_record_service.check_health_risk(record.bpm, record.temp, record.spo2)
+        "is_critical": is_critical,
+        "riskScore": risk["riskScore"],
+        "riskLevel": risk["riskLevel"],
+        "reasons": risk["reasons"]
     }
+
+    if include_ai:
+        payload["aiExplanation"] = call_local_ai_explanation(record.bpm, record.temp, record.spo2, risk)
+
     if include_id:
         payload["id"] = record.id
     return payload
@@ -87,7 +233,7 @@ def serialize_health_record(record, include_id=True):
 def get_health_records():
     """Fetches health records based on the JWT user's role."""
     user_info = g.user
-    
+
     if user_info['profileType'] == 'DOCTOR':
         records = health_record_service.get_all_health_records()
     elif user_info['profileType'] == 'PATIENT':
@@ -134,7 +280,7 @@ def get_health_records():
 def get_latest_health_record():
     """Fetches the latest health record for the logged-in patient."""
     user_info = g.user
-    
+
     if user_info['profileType'] != 'PATIENT':
         return jsonify({"error": "This endpoint is only for users with the PATIENT profile type"}), 403
 
@@ -151,7 +297,6 @@ def get_latest_health_record():
 
     result = serialize_health_record(record)
     return jsonify(result), 200
-
 
 
 # --- GET Latest Endpoint for Academic Demo (No JWT) ---
@@ -176,7 +321,7 @@ def get_latest_health_record_demo():
     if not record:
         return jsonify({"error": "No health records found for demo device"}), 404
 
-    return jsonify(serialize_health_record(record, include_id=False)), 200
+    return jsonify(serialize_health_record(record, include_id=False, include_ai=True)), 200
 
 
 # --- POST Endpoint for Devices (API Key Auth) ---
@@ -215,7 +360,7 @@ def create_health_record():
     auth_result = authenticate_request()
     if auth_result:
         return auth_result
-        
+
     data = request.json
     try:
         device_id = data["device_id"]
@@ -223,20 +368,25 @@ def create_health_record():
         temp = data["temp"]
         spo2 = data["spo2"]
         created_at = data.get("created_at")
-        
+
         # Service now returns a tuple: (record, trigger_alert)
         record, trigger_alert = health_record_service.create_health_record(
             device_id, bpm, temp, spo2, created_at, request.headers.get("X-API-Key")
         )
-        
+
+        risk = calculate_predictive_risk(record.bpm, record.temp, record.spo2)
         response_payload = {
             "id": record.id,
             "device_id": record.device_id,
             "bpm": record.bpm,
             "temp": record.temp,
+            "temperature": record.temp,
             "spo2": record.spo2,
             "created_at": format_created_at(record.created_at),
             "is_critical": trigger_alert,
+            "riskScore": risk["riskScore"],
+            "riskLevel": risk["riskLevel"],
+            "reasons": risk["reasons"],
             "actuator_command": {
                 "alarm": trigger_alert
             }
